@@ -1,5 +1,8 @@
 #include "ops.h"
 
+#include <mutex>
+#include <map>
+
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
@@ -7,10 +10,15 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "ri-vq.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <thread>
 
 // ggml_compute_forward_dup
 
@@ -9134,9 +9142,284 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 }
 
+// RI-VQ sparse-V flash attention: exact QK scoring with V reads only for top tokens.
+//
+// Activated via GGML_RI_VQ_ATTN=1 environment variable.
+// Only modify this function - ri-vq.h/ri-vq.cpp are stable.
+static void ggml_compute_forward_flash_attn_ext_ri_vq(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q, ne)
+    GGML_TENSOR_LOCALS(size_t, nbq, q, nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k, ne)
+    GGML_TENSOR_LOCALS(size_t, nbk, k, nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v, ne)
+    GGML_TENSOR_LOCALS(size_t, nbv, v, nb)
+    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne)
+    GGML_TENSOR_LOCALS(size_t, nb, dst, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+    const int64_t N  = neq1;
+
+    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne2 == N);
+    GGML_ASSERT(neq0 == DK);
+    GGML_ASSERT(nek0 == DK);
+    GGML_ASSERT(nev0 == DV);
+    GGML_ASSERT(nbq0 == ggml_type_size(q->type));
+    GGML_ASSERT(nbk0 == ggml_type_size(k->type));
+    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
+    GGML_ASSERT(nb0 == sizeof(float));
+
+    float scale = 1.0f;
+    memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
+
+    const int64_t n_kv = nek1;
+    const int64_t rk2 = neq2 / nek2;
+    const int64_t rk3 = neq3 / nek3;
+    const int64_t rv2 = neq2 / nev2;
+    const int64_t rv3 = neq3 / nev3;
+
+    static constexpr int BLOCK_DIM = 4;
+    static constexpr int CODEBOOK_N = 256;
+    static constexpr int RERANK_K = 64;
+
+    // Per-layer codebook storage: layer index -> (Codebook, GramTable)
+    struct LayerCodebook {
+        ri_vq::Codebook codebook;
+        ri_vq::GramTable gram;
+    };
+    static std::map<int, LayerCodebook> layer_codebooks;
+    static std::mutex layer_codebooks_mtx;
+
+    struct kv_cache {
+        const void * k_data = nullptr;
+        const void * v_data = nullptr;
+        int64_t ik2 = -1;
+        int64_t ik3 = -1;
+        int64_t iv2 = -1;
+        int64_t iv3 = -1;
+        int64_t n_kv = -1;
+        int64_t dk = -1;
+        int64_t dv = -1;
+        int  layer_idx = -1;
+        std::vector<ri_vq::CompressedKey> keys;
+        std::vector<ri_vq::CompressedValue> values;
+        ri_vq::FullyPreparedIndex index;
+    };
+    static thread_local kv_cache cache;
+
+    int ith = params->ith;
+    int nth = params->nth;
+
+    GGML_ASSERT(DK % BLOCK_DIM == 0);
+    GGML_ASSERT(DV % BLOCK_DIM == 0);
+    GGML_ASSERT(DK / BLOCK_DIM <= ri_vq::MAX_BLOCK_DIM);
+    GGML_ASSERT(DV / BLOCK_DIM <= ri_vq::MAX_BLOCK_DIM);
+
+    (void)ith; (void)nth;
+
+    for (int64_t ir = ith; ir < neq3*neq2*neq1; ir += nth) {
+        const int64_t iq3 = ir / (neq2 * neq1);
+        const int64_t iq2 = (ir - iq3 * neq2 * neq1) / neq1;
+        const int64_t iq1 = ir - iq3 * neq2 * neq1 - iq2 * neq1;
+
+        const int64_t ik3 = iq3 / rk3;
+        const int64_t ik2 = iq2 / rk2;
+        const int64_t iv3 = iq3 / rv3;
+        const int64_t iv2 = iq2 / rv2;
+
+        // Per-layer codebook initialization (thread-safe lazy init keyed by layer)
+        int layer_idx = (int) ik2;
+        {
+            std::lock_guard<std::mutex> lock(layer_codebooks_mtx);
+            auto it = layer_codebooks.find(layer_idx);
+            if (it == layer_codebooks.end()) {
+                if (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) {
+                    GGML_ABORT("unsupported K type for RI-VQ sparse-V attention");
+                }
+
+                const int64_t n_vectors = nek1;
+                std::vector<float> blocks;
+                blocks.reserve((size_t) n_vectors * DK);
+
+                for (int64_t ic = 0; ic < n_vectors; ic++) {
+                    const char * k_data = (const char *) k->data +
+                        ic * nbk1 + ik2 * nbk2 + ik3 * nbk3;
+                    if (k->type == GGML_TYPE_F32) {
+                        const float * k_f32 = (const float *) k_data;
+                        blocks.insert(blocks.end(), k_f32, k_f32 + DK);
+                    } else {
+                        const ggml_fp16_t * k_f16 = (const ggml_fp16_t *) k_data;
+                        for (int64_t d = 0; d < DK; d++) {
+                            blocks.push_back(GGML_CPU_FP16_TO_FP32(k_f16[d]));
+                        }
+                    }
+                }
+
+                LayerCodebook lc;
+                lc.codebook = ri_vq::train_codebook(
+                    blocks.data(), (int) (blocks.size() / BLOCK_DIM), BLOCK_DIM,
+                    CODEBOOK_N, 50, 42 + layer_idx);
+                lc.gram = ri_vq::build_gram_table(lc.codebook);
+                layer_codebooks[layer_idx] = std::move(lc);
+            }
+        }
+
+        const auto & lc = layer_codebooks.at(layer_idx);
+        const ri_vq::Codebook & codebook = lc.codebook;
+        const ri_vq::GramTable & gram = lc.gram;
+
+        if (cache.k_data != k->data ||
+            cache.v_data != v->data ||
+            cache.ik2 != ik2 || cache.ik3 != ik3 ||
+            cache.iv2 != iv2 || cache.iv3 != iv3 ||
+            cache.n_kv != n_kv || cache.dk != DK || cache.dv != DV ||
+            cache.layer_idx != layer_idx) {
+            if (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) {
+                GGML_ABORT("unsupported K type for RI-VQ sparse-V attention");
+            }
+            if (v->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F16) {
+                GGML_ABORT("unsupported V type for RI-VQ sparse-V attention");
+            }
+
+            cache.k_data = k->data;
+            cache.v_data = v->data;
+            cache.ik2 = ik2;
+            cache.ik3 = ik3;
+            cache.iv2 = iv2;
+            cache.iv3 = iv3;
+            cache.n_kv = n_kv;
+            cache.dk = DK;
+            cache.dv = DV;
+            cache.layer_idx = layer_idx;
+            cache.keys.resize(n_kv);
+            cache.values.resize(n_kv);
+
+            std::vector<float> k_f32(DK);
+            std::vector<float> v_f32(DV);
+            for (int64_t ic = 0; ic < n_kv; ic++) {
+                const char * k_data = (const char *) k->data +
+                    ic * nbk1 + ik2 * nbk2 + ik3 * nbk3;
+                if (k->type == GGML_TYPE_F32) {
+                    memcpy(k_f32.data(), k_data, DK * sizeof(float));
+                } else {
+                    const ggml_fp16_t * k_f16 = (const ggml_fp16_t *) k_data;
+                    for (int64_t d = 0; d < DK; d++) {
+                        k_f32[d] = GGML_CPU_FP16_TO_FP32(k_f16[d]);
+                    }
+                }
+                cache.keys[ic] = ri_vq::quantize_key(k_f32.data(), DK, codebook);
+
+                const char * v_data = (const char *) v->data +
+                    ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
+                if (v->type == GGML_TYPE_F32) {
+                    memcpy(v_f32.data(), v_data, DV * sizeof(float));
+                } else {
+                    const ggml_fp16_t * v_f16 = (const ggml_fp16_t *) v_data;
+                    for (int64_t d = 0; d < DV; d++) {
+                        v_f32[d] = GGML_CPU_FP16_TO_FP32(v_f16[d]);
+                    }
+                }
+                cache.values[ic] = ri_vq::quantize_value(v_f32.data(), DV, codebook);
+            }
+
+            // Build the prepared index for compressed-domain scoring
+            cache.index = ri_vq::build_prepared_index(cache.keys, (int) n_kv, (int) DK, codebook);
+        }
+
+        // Prepare query for compressed-domain scoring
+        std::vector<float> q_f32(DK);
+        const char * q_ptr = (const char *) q->data + (iq1 * nbq1 + iq2 * nbq2 + iq3 * nbq3);
+        if (q->type == GGML_TYPE_F32) {
+            memcpy(q_f32.data(), q_ptr, DK * sizeof(float));
+        } else if (q->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * q_h = (const ggml_fp16_t *) q_ptr;
+            for (int d = 0; d < DK; d++) q_f32[d] = GGML_CPU_FP16_TO_FP32(q_h[d]);
+        } else {
+            GGML_ABORT("unsupported Q type for RI-VQ sparse-V attention");
+        }
+
+        const ggml_fp16_t * mp = mask ?
+            (ggml_fp16_t *)((char *) mask->data + iq1 * mask->nb[1] +
+                            (iq2 % mask->ne[2]) * mask->nb[2] +
+                            (iq3 % mask->ne[3]) * mask->nb[3]) : nullptr;
+
+        // Compressed-domain scoring using Gram table lookups (no decode needed)
+        ri_vq::PreparedQuery pq = ri_vq::prepare_query(q_f32.data(), (int) DK, codebook);
+        ri_vq::PrefetchedGramRows prefetched = ri_vq::prefetch_gram_rows(pq, gram);
+        std::vector<std::pair<int, float>> scored = ri_vq::score_all_tokens(cache.index, prefetched);
+
+        // Apply mask and scale
+        for (int64_t ic = 0; ic < n_kv; ic++) {
+            if (mp) {
+                float mv = GGML_CPU_FP16_TO_FP32(mp[ic]);
+                if (mv == -INFINITY) {
+                    scored[ic].second = -INFINITY;
+                    continue;
+                }
+            }
+            scored[ic].second *= scale;
+        }
+
+        // Select top-k candidates using nth_element (compressed-domain scores)
+        int n_candidates = std::min((int)RERANK_K, (int)n_kv);
+        if (n_candidates > 0 && n_candidates < (int)n_kv) {
+            std::nth_element(scored.begin(), scored.begin() + n_candidates, scored.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+        }
+
+        // Softmax-weighted V sum, decoding V only for selected top-k candidates
+        float M = -INFINITY;
+        float S = 0.0f;
+        std::vector<float> VKQ(DV, 0.0f);
+        std::vector<float> V32(DV);
+
+        for (int i = 0; i < n_candidates; i++) {
+            int ic = scored[i].first;
+            float s = scored[i].second;
+            if (s == -INFINITY) continue;
+
+            float new_M = std::max(M, s);
+            float exp_old = std::exp(M - new_M);
+            float exp_new = std::exp(s - new_M);
+
+            for (int64_t d = 0; d < DV; d++) VKQ[d] *= exp_old;
+
+            ri_vq::decode_value(cache.values[ic], codebook, V32.data(), DV);
+
+            for (int64_t d = 0; d < DV; d++) VKQ[d] += V32[d] * exp_new;
+
+            S = S * exp_old + exp_new;
+            M = new_M;
+        }
+
+        float S_inv = S == 0.0f ? 0.0f : 1.0f / S;
+        float * dst_ptr = (float *) ((char *) dst->data +
+                        (iq3 * ne2 * ne1 + iq2 + iq1 * ne1) * nb1);
+        for (int64_t d = 0; d < DV; d++) dst_ptr[d] = VKQ[d] * S_inv;
+    }
+}
+
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // Check for RI-VQ sparse-V attention via environment variable
+    // GGML_RI_VQ_ATTN=1 enables exact QK scoring with sparse V reads
+    static bool ri_vq_enabled = []() {
+        const char * env = std::getenv("GGML_RI_VQ_ATTN");
+        return env && env[0] == '1';
+    }();
+    if (ri_vq_enabled) {
+        ggml_compute_forward_flash_attn_ext_ri_vq(params, dst);
+        return;
+    }
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:

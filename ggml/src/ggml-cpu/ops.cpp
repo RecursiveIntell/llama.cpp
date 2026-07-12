@@ -1,8 +1,5 @@
 #include "ops.h"
 
-#include <mutex>
-#include <map>
-
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
